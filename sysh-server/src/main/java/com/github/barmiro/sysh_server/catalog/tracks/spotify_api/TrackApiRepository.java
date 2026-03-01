@@ -3,6 +3,7 @@ package com.github.barmiro.sysh_server.catalog.tracks.spotify_api;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,58 +22,51 @@ import com.github.barmiro.sysh_server.common.utils.ConvertDTOs;
 import com.github.barmiro.sysh_server.spotifyauthorization.SpotifyTokenService;
 
 @Repository
-public class TrackApiRepository extends SpotifyApiRepository<
-											TrackRepository,
-											Track,
-											ApiTrack,
-											TracksWrapper> {
+public class TrackApiRepository extends SpotifyApiRepository<TrackRepository, Track, ApiTrack, TracksWrapper> {
 
-
-	public TrackApiRepository(JdbcClient jdbc, RestClient apiClient, SpotifyTokenService tkn, TrackRepository catalogRepository) {
+	public TrackApiRepository(JdbcClient jdbc, RestClient apiClient, SpotifyTokenService tkn,
+			TrackRepository catalogRepository) {
 		super(jdbc, apiClient, tkn, catalogRepository);
 	}
-	
+
 	private static final Logger log = LoggerFactory.getLogger(TrackApiRepository.class);
 
-	public List<ApiTrack> getApiTracks(List<String> track_ids, String username) throws JsonProcessingException, ClassCastException {
-		
+	public List<ApiTrack> getApiTracks(List<String> track_ids, String username)
+			throws JsonProcessingException, ClassCastException {
 		List<String> newIDs = getNewIDs(track_ids, "spotify_track_id");
 		log.info("Found " + newIDs.size() + " new tracks.");
-		List<String> packets = new ArrayList<>();
-		
-		packets = prepIdPackets(newIDs, 50);			
 
-		
+		List<String> packets = prepIdPackets(newIDs, 50);
 		List<ApiTrack> apiTracks = new ArrayList<>();
-		for (String packet:packets) {
-			
-			ResponseEntity<String> response = null;
-			response = getResponse(packet, username);
-			
+
+		for (String packet : packets) {
+			ResponseEntity<String> response = getResponse(packet, username);
+
 			if (response == null) {
 				log.error("Response for " + packet + " is null.");
 				continue;
 			}
 
-			apiTracks.addAll(mapResponse(response));
+			List<ApiTrack> mappedTracks = mapResponse(response);
 
+			if (mappedTracks != null) {
+				// Filter out nulls from the mapped response before adding to the main list
+				mappedTracks.stream()
+						.filter(Objects::nonNull)
+						.forEach(apiTracks::add);
+			}
 		}
-		
-		if (apiTracks.size() == 0) {
-			log.info("No tracks to add.");
-			return new ArrayList<ApiTrack>();
-		}
-		
+
 		return apiTracks;
 	}
-		
-	public List<Track> addNewTracks (List<ApiTrack> apiTracks) throws IllegalAccessException, InvocationTargetException {
-		
+
+	public List<Track> addNewTracks(List<ApiTrack> apiTracks) throws IllegalAccessException, InvocationTargetException {
+
 		List<Track> tracks = ConvertDTOs.apiTracks(apiTracks);
-		
+
 		catalogRepository.addTracks(tracks);
-		
+
 		return tracks;
-		
+
 	}
 }

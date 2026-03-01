@@ -6,11 +6,17 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+import java.nio.charset.StandardCharsets;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.retry.annotation.Backoff;
 import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Repository;
+import org.springframework.web.client.HttpClientErrorException; // Added
 import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
@@ -21,20 +27,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.barmiro.sysh_server.spotifyauthorization.SpotifyTokenService;
 
 @Repository
-public abstract class SpotifyApiRepository<
-	RepositoryClass extends CatalogRepository<EntityClass>,
-	EntityClass extends CatalogEntity,
-	ApiEntityClass extends ApiEntity,
-	WrapperClass extends ApiWrapper<? extends ApiEntity>>
-	{
+public abstract class SpotifyApiRepository<RepositoryClass extends CatalogRepository<EntityClass>, EntityClass extends CatalogEntity, ApiEntityClass extends ApiEntity, WrapperClass extends ApiWrapper<? extends ApiEntity>> {
+
+	private static final Logger log = LoggerFactory.getLogger(SpotifyApiRepository.class);
 
 	protected final JdbcClient jdbc;
 	protected final RestClient apiClient;
 	protected final SpotifyTokenService tkn;
 	protected final RepositoryClass catalogRepository;
-	
-	protected SpotifyApiRepository(JdbcClient jdbc, 
-			RestClient apiClient, 
+
+	protected SpotifyApiRepository(JdbcClient jdbc,
+			RestClient apiClient,
 			SpotifyTokenService tkn,
 			RepositoryClass catalogRepository) {
 		this.jdbc = jdbc;
@@ -42,48 +45,47 @@ public abstract class SpotifyApiRepository<
 		this.tkn = tkn;
 		this.catalogRepository = catalogRepository;
 	}
-	
+
 	@SuppressWarnings("unchecked")
 	Class<EntityClass> getEntityClass() throws ClassCastException {
 		ParameterizedType superClass = (ParameterizedType) getClass()
 				.getGenericSuperclass();
 		return (Class<EntityClass>) superClass.getActualTypeArguments()[1];
 	}
-	
+
 	@SuppressWarnings("unchecked")
 	Class<WrapperClass> getWrapperClass() throws ClassCastException {
 		ParameterizedType superClass = (ParameterizedType) getClass()
-										.getGenericSuperclass();
+				.getGenericSuperclass();
 		return (Class<WrapperClass>) superClass.getActualTypeArguments()[3];
 	}
-	
-	
+
 	@SuppressWarnings("unchecked")
 	protected List<ApiEntityClass> mapResponse(
-			ResponseEntity<String> response
-			) throws JsonProcessingException {
-		
+			ResponseEntity<String> response) throws JsonProcessingException {
+
+		if (response.getBody() == null)
+			return new ArrayList<>();
+
 		Class<WrapperClass> wrapper = getWrapperClass();
-		
+
 		ObjectMapper mapper = new ObjectMapper()
-				.configure(DeserializationFeature
-						.FAIL_ON_UNKNOWN_PROPERTIES, false);
-		
+				.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
 		return (List<ApiEntityClass>) mapper.readValue(response.getBody(), wrapper).unwrap();
 	}
-	
-	
+
 	protected List<String> getNewIDs(List<String> entityIDs,
 			String idName) {
-		
+
 		Class<EntityClass> entCls = getEntityClass();
 		List<String> newIDs = new ArrayList<>();
-		
-		for(String entityID:entityIDs) {
+
+		for (String entityID : entityIDs) {
 			Optional.ofNullable(entityID)
-						.filter(id -> !id.isEmpty())
-						.orElseThrow();
-			
+					.filter(id -> !id.isEmpty())
+					.orElseThrow();
+
 			int exists = jdbc.sql("SELECT * FROM "
 					+ entCls.getSimpleName() + "s "
 					+ "WHERE " + idName + " = :entityID "
@@ -92,71 +94,69 @@ public abstract class SpotifyApiRepository<
 					.query(entCls)
 					.list()
 					.size();
-			
+
 			if (exists == 0 && !newIDs.contains(entityID)) {
 				newIDs.add(entityID);
 			}
 		}
 		return newIDs;
 	}
-	
-	
+
 	protected String stringify(List<String> newIDs) {
 		Class<EntityClass> entCls = getEntityClass();
-		
+
 		StringBuilder sb = new StringBuilder();
 		sb.append(entCls.getSimpleName().toLowerCase() + "s?ids=");
-		
-		for (String id:newIDs) {
+
+		for (String id : newIDs) {
 			sb.append(id + ",");
 		}
-		
+
 		sb.deleteCharAt(sb.length() - 1);
 		return sb.toString();
 	}
 
-	
 	protected List<String> prepIdPackets(
 			List<String> IDlist,
-			int limit
-			) {
+			int limit) {
 
 		int listSize = IDlist.size();
-		
+
 		List<String> idPackets = new ArrayList<>();
-		
-		for(int i = 0; i < listSize; i += limit) {
-			if (i + limit >= listSize) {
-				limit = listSize - i;
-			}
-			String idPacket = stringify(IDlist.subList(i, i + limit));
+
+		for (int i = 0; i < listSize; i += limit) {
+			int currentLimit = Math.min(limit, listSize - i);
+			String idPacket = stringify(IDlist.subList(i, i + currentLimit));
 			idPackets.add(idPacket);
 		}
-		
+
 		return idPackets;
 	}
-	
-	
-    @Retryable(
-            value = { 
-        		HttpServerErrorException.class,
-        		ResourceAccessException.class
-            },
-            maxAttempts = 5,
-            backoff = @Backoff(delay = 2000, multiplier = 2),
-            label = "SpotifyApiRepository.getResponse"
-        )
+
+	@Retryable(retryFor = {
+			HttpServerErrorException.class,
+			ResourceAccessException.class,
+			HttpClientErrorException.TooManyRequests.class
+	}, maxAttempts = 5, backoff = @Backoff(delay = 3000, multiplier = 2), label = "SpotifyApiRepository.getResponse")
 	protected ResponseEntity<String> getResponse(String packet, String username) {
-		
-		
-		ResponseEntity<String> response = apiClient
+
+		return apiClient
 				.get()
 				.uri(packet)
 				.header("Authorization", "Bearer " + tkn.getToken(username))
 				.retrieve()
+				.onStatus(status -> status.value() == 429, (request, response) -> {
+					String retryAfter = response.getHeaders().getFirst("Retry-After");
+					log.warn("Spotify Rate Limit hit! Retry-After: {} seconds", retryAfter);
+
+					// Use .create() instead of 'new'
+					throw HttpClientErrorException.create(
+							HttpStatus.TOO_MANY_REQUESTS,
+							"Rate limit exceeded",
+							response.getHeaders(),
+							response.getBody().readAllBytes(),
+							StandardCharsets.UTF_8);
+				})
 				.toEntity(String.class);
-		
-		return Optional.ofNullable(response).orElseThrow();
 	}
 }
-
