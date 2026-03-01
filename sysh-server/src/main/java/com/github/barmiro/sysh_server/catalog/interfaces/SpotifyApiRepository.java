@@ -133,13 +133,9 @@ public abstract class SpotifyApiRepository<RepositoryClass extends CatalogReposi
 		return idPackets;
 	}
 
-	@Retryable(retryFor = {
-			HttpServerErrorException.class,
-			ResourceAccessException.class,
-			HttpClientErrorException.TooManyRequests.class
-	}, maxAttempts = 5, backoff = @Backoff(delay = 3000, multiplier = 2), label = "SpotifyApiRepository.getResponse")
+	@Retryable(retryFor = { HttpServerErrorException.class, ResourceAccessException.class }, // Remove 429 from here
+			maxAttempts = 3, backoff = @Backoff(delay = 2000))
 	protected ResponseEntity<String> getResponse(String packet, String username) {
-
 		return apiClient
 				.get()
 				.uri(packet)
@@ -147,15 +143,20 @@ public abstract class SpotifyApiRepository<RepositoryClass extends CatalogReposi
 				.retrieve()
 				.onStatus(status -> status.value() == 429, (request, response) -> {
 					String retryAfter = response.getHeaders().getFirst("Retry-After");
-					log.warn("Spotify Rate Limit hit! Retry-After: {} seconds", retryAfter);
+					long waitSeconds = (retryAfter != null) ? Long.parseLong(retryAfter) : 0;
 
-					// Use .create() instead of 'new'
+					log.error("!!! SPOTIFY RATE LIMIT !!! Wait for {} seconds ({} hours)",
+							waitSeconds, String.format("%.2f", waitSeconds / 3600.0));
+
+					// If the wait is longer than 1 minute, don't even bother retrying.
+					if (waitSeconds > 60) {
+						throw new RuntimeException("Hard Rate Limit: Must wait " + waitSeconds + " seconds.");
+					}
+
+					// Otherwise, throw the exception to trigger @Retryable
 					throw HttpClientErrorException.create(
-							HttpStatus.TOO_MANY_REQUESTS,
-							"Rate limit exceeded",
-							response.getHeaders(),
-							response.getBody().readAllBytes(),
-							StandardCharsets.UTF_8);
+							HttpStatus.TOO_MANY_REQUESTS, "Rate limit", response.getHeaders(),
+							response.getBody().readAllBytes(), StandardCharsets.UTF_8);
 				})
 				.toEntity(String.class);
 	}

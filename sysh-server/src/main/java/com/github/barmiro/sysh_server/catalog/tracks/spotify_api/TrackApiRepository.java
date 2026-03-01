@@ -55,6 +55,12 @@ public class TrackApiRepository extends SpotifyApiRepository<TrackRepository, Tr
 						.filter(Objects::nonNull)
 						.forEach(apiTracks::add);
 			}
+
+			try {
+				Thread.sleep(300);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
 		}
 
 		return apiTracks;
