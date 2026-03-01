@@ -35,6 +35,7 @@ public abstract class SpotifyApiRepository<RepositoryClass extends CatalogReposi
 	protected final RestClient apiClient;
 	protected final SpotifyTokenService tkn;
 	protected final RepositoryClass catalogRepository;
+	private static long backoffUntil = 0;
 
 	protected SpotifyApiRepository(JdbcClient jdbc,
 			RestClient apiClient,
@@ -75,31 +76,22 @@ public abstract class SpotifyApiRepository<RepositoryClass extends CatalogReposi
 		return (List<ApiEntityClass>) mapper.readValue(response.getBody(), wrapper).unwrap();
 	}
 
-	protected List<String> getNewIDs(List<String> entityIDs,
-			String idName) {
-
+	protected List<String> getNewIDs(List<String> entityIDs, String idName) {
 		Class<EntityClass> entCls = getEntityClass();
-		List<String> newIDs = new ArrayList<>();
+		String tableName = entCls.getSimpleName() + "s";
 
-		for (String entityID : entityIDs) {
-			Optional.ofNullable(entityID)
-					.filter(id -> !id.isEmpty())
-					.orElseThrow();
+		// 1. Get all existing IDs in this set from the DB in ONE query
+		List<String> existingIDs = jdbc
+				.sql("SELECT " + idName + " FROM " + tableName + " WHERE " + idName + " IN (:ids)")
+				.param("ids", entityIDs)
+				.query(String.class)
+				.list();
 
-			int exists = jdbc.sql("SELECT * FROM "
-					+ entCls.getSimpleName() + "s "
-					+ "WHERE " + idName + " = :entityID "
-					+ "LIMIT 1")
-					.param("entityID", entityID, Types.VARCHAR)
-					.query(entCls)
-					.list()
-					.size();
-
-			if (exists == 0 && !newIDs.contains(entityID)) {
-				newIDs.add(entityID);
-			}
-		}
-		return newIDs;
+		// 2. Return only the IDs that weren't found in the database
+		return entityIDs.stream()
+				.distinct()
+				.filter(id -> !existingIDs.contains(id))
+				.toList();
 	}
 
 	protected String stringify(List<String> newIDs) {
@@ -133,9 +125,15 @@ public abstract class SpotifyApiRepository<RepositoryClass extends CatalogReposi
 		return idPackets;
 	}
 
-	@Retryable(retryFor = { HttpServerErrorException.class, ResourceAccessException.class }, // Remove 429 from here
-			maxAttempts = 3, backoff = @Backoff(delay = 2000))
 	protected ResponseEntity<String> getResponse(String packet, String username) {
+		// 1. Check if we are currently in a "lockout" period
+		long currentTime = System.currentTimeMillis();
+		if (currentTime < backoffUntil) {
+			long waitLeft = (backoffUntil - currentTime) / 1000;
+			log.error("Circuit Breaker Active: Skipping request. Still blocked for {} seconds", waitLeft);
+			throw new RuntimeException("Spotify API is currently locked out.");
+		}
+
 		return apiClient
 				.get()
 				.uri(packet)
@@ -143,20 +141,13 @@ public abstract class SpotifyApiRepository<RepositoryClass extends CatalogReposi
 				.retrieve()
 				.onStatus(status -> status.value() == 429, (request, response) -> {
 					String retryAfter = response.getHeaders().getFirst("Retry-After");
-					long waitSeconds = (retryAfter != null) ? Long.parseLong(retryAfter) : 0;
+					long waitSeconds = (retryAfter != null) ? Long.parseLong(retryAfter) : 3600; // Default 1hr if null
 
-					log.error("!!! SPOTIFY RATE LIMIT !!! Wait for {} seconds ({} hours)",
-							waitSeconds, String.format("%.2f", waitSeconds / 3600.0));
+					// 2. Set the global backoff timer
+					backoffUntil = System.currentTimeMillis() + (waitSeconds * 1000);
 
-					// If the wait is longer than 1 minute, don't even bother retrying.
-					if (waitSeconds > 60) {
-						throw new RuntimeException("Hard Rate Limit: Must wait " + waitSeconds + " seconds.");
-					}
-
-					// Otherwise, throw the exception to trigger @Retryable
-					throw HttpClientErrorException.create(
-							HttpStatus.TOO_MANY_REQUESTS, "Rate limit", response.getHeaders(),
-							response.getBody().readAllBytes(), StandardCharsets.UTF_8);
+					log.error("!!! SPOTIFY RATE LIMIT !!! Wait for {} seconds", waitSeconds);
+					throw new RuntimeException("Rate limit hit. Blocking all requests for " + waitSeconds + "s");
 				})
 				.toEntity(String.class);
 	}
